@@ -1,0 +1,155 @@
+///
+///
+/// FACILITY    : db utility mp feeder
+///
+/// FILE NAME   : mp_feed_dbu.pc
+///
+/// AUTHOR      : Thanakorn Nitipiromchai
+///
+/// CREATE DATE : 04-Feb-2021
+///
+/// CURRENT VERSION NO : 1.0
+///
+/// LAST RELEASE DATE  : 04-Feb-2021
+///
+/// MODIFICATION HISTORY :
+///     1.0         04-Feb-2021     First Version
+///
+///
+#include "mp_feed_dbu.h"
+#include <sqlca.h>
+#include <sqlda.h>
+#include <sqlcpr.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+typedef enum {
+    E_PROC_STAT = 0,
+    E_COMPANY,
+    E_CUSTCAT,
+    E_FRD_TYPE,
+    E_MOBSTATUS,
+    E_CUSTSUBCAT,
+    E_BILLSTART,
+    E_PROVINCE,
+    E_MOBSEGMENT,
+    E_SUSP_REASON,
+    E_FRD_GROUP,
+    E_ORD_REASON,
+    E_BILLCYCLE,
+    E_NETTYPE,
+    E_PROC_ID,
+    E_CARDTYPE,
+    E_PAYTYPE,
+    E_MP_SOF_TYPE,
+    E_NOF_LOV
+} E_LOV_TYPE;
+
+const char gszLovType[E_NOF_LOV][SIZE_ITEM_T] = {
+    "PROCESS_STATUS",
+    "FRM_COMPANY",
+    "FRM_ACCOUNT_CATEGORY",
+    "FRAUD_TYPE",
+    "FRM_MOBILE_STATUS",
+    "FRM_ACCOUNT_SUBCAT",
+    "FRM_BILLSTART",
+    "FRM_PROVINCE",
+    "FRM_MOBSEGMENT",
+    "SUSPEND_REASON",
+    "FRAUD_GROUP",
+    "ORDER_REASON",
+    "FRM_BILLCYCLE",
+    "FRM_NETWORKTYPE",
+    "PROCESS_ID",
+    "FRM_IDCARDTYPE",
+    "PAY_TYPE",
+    "MPAY_SOF_TYPE"
+};
+
+int connectDbErm(char *szDbUsr, char *szDbPwd, char *szDbSvr, int nRetryCnt, int nRetryWait)
+{
+
+    int retry = nRetryCnt;
+    int result = SUCCESS;
+
+    EXEC SQL DECLARE ERM_DB DATABASE;
+    do {
+        writeLog(LOG_INF, "%sconnecting %s db ...", ( retry != nRetryCnt ? "retry " : "" ), szDbSvr);
+        EXEC SQL CONNECT :szDbUsr IDENTIFIED BY :szDbPwd AT ERM_DB USING :szDbSvr;
+        if (sqlca.sqlcode == SUCCESS) {
+            return SUCCESS;
+        }
+        else {
+            trimStr((unsigned char*)trimStr((unsigned char*)sqlca.sqlerrm.sqlerrmc));
+            writeLog(LOG_ERR, "connectDbErm failed ora(%d) - %s", sqlca.sqlcode, trimStr((unsigned char*)sqlca.sqlerrm.sqlerrmc));
+            result = FAILED;
+            sleep(nRetryWait);
+        }
+        retry--;
+    }
+    while ( retry > 0 );
+
+    return result;
+
+}
+
+void disconnErm(char *dbsvr)
+{
+    EXEC SQL AT ERM_DB COMMIT WORK RELEASE;
+    writeLog(LOG_INF, "disconnected from %s", dbsvr);
+}
+
+
+int loadFruadLov(sqlite3 **db)
+{
+    //SELECT LOV_ID, LOV_DESC FROM FRAUD_LOV WHERE LOV_TYPE = 'MPAY_SOF_TYPE';
+    VARCHAR szSql[SIZE_BUFF];
+    int nCnt = 0, db_err_cnt = 0, rc;
+
+    char lovid[100];
+    char lovdesc[100];
+    char *str, insstr[120*100];
+
+    // ---------- start query data --------
+    sprintf((char*)szSql.arr, "SELECT LOV_ID, LOV_DESC FROM FRAUD_LOV WHERE LOV_TYPE = '%s'", gszLovType[E_MP_SOF_TYPE]);
+    szSql.len = strlen((char*)szSql.arr);
+    writeLog(LOG_DB1, (char*)szSql.arr);
+
+    EXEC SQL AT ERM_DB PREPARE orcStmt FROM :szSql;
+    EXEC SQL AT ERM_DB DECLARE orcOneCrs CURSOR FOR orcStmt;
+    EXEC SQL AT ERM_DB OPEN orcOneCrs;
+
+    if ( sqlca.sqlcode < SUCCESS ) {
+        writeLog(LOG_ERR, "loadFruadLov: Ora(%d) Open orcOneCrs Error on FRAUD_LOV table (%s)", sqlca.sqlcode, trimStr((unsigned char*)sqlca.sqlerrm.sqlerrmc));
+        EXEC SQL AT ERM_DB CLOSE orcOneCrs;
+        return FAILED;
+    }
+
+    memset(insstr, 0x00, sizeof(insstr));
+    
+    while ( TRUE ) {
+        memset(lovid, 0x00, sizeof(lovid));
+        memset(lovdesc, 0x00, sizeof(lovdesc));
+
+        EXEC SQL AT ERM_DB FETCH orcOneCrs INTO
+                :lovid,
+                :lovdesc;
+        if ( sqlca.sqlcode == NOT_FOUND ) {
+            break;
+        }
+        
+        sprintf(insstr, "%sINSERT INTO LOV_CODE VALUES('%s', '%s');\n", insstr, trimStr(lovid), trimStr(lovdesc));
+        nCnt++;
+    }   /* End of outer while loop (1) */
+    EXEC SQL AT ERM_DB CLOSE orcOneCrs;
+    
+    if ( nCnt > 0 ) {
+        sqlite3_exec(*db, "BEGIN;", NULL, NULL, NULL);
+        rc = sqlite3_exec(*db, insstr, 0, 0, &str);
+        if ( rc == SQLITE_OK || rc == SQLITE_CONSTRAINT ) {
+            sqlite3_exec(*db, "COMMIT;", NULL, NULL, NULL);
+            writeLog(LOG_INF, "%d records of fruad_lov loaded.", nCnt);
+        }
+    }
+    return nCnt;
+}
